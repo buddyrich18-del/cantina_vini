@@ -4,6 +4,7 @@
 import { getKey } from './ai.js';
 import { findStyle } from './kb.js';
 import { normName } from './importer.js';
+import { Capacitor } from '@capacitor/core';
 
 const MODEL = 'claude-haiku-5-5';
 
@@ -140,7 +141,22 @@ export async function searchPhotos({ name, producer, vintage, barcode }) {
     if (ii && /\.(jpe?g|png|webp)$/i.test(pg.title || '') && [...want].some((t) => hay.has(t))) add(ii.thumburl || ii.url, ii.thumburl, 'Wikimedia Commons');
   }
 
-  // 3) Con la chiave API: ricerca web mirata sulle pagine dei negozi/produttori
+  // 3) Ricerca immagini sul web (solo nell'app Android: lì le richieste non hanno limiti CORS)
+  if (Capacitor.isNativePlatform() && out.length < 6) {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 12000);
+      const r = await fetch(`https://www.bing.com/images/search?q=${encodeURIComponent(`${q} ${vintage || ''} bottiglia vino`.replace(/\s+/g, ' '))}&form=HDRSC2&first=1`, { signal: ctl.signal });
+      const html = r.ok ? await r.text() : '';
+      clearTimeout(t);
+      const un = (x) => x.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+      const re = /murl(?:&quot;|")\s*:\s*(?:&quot;|")(.*?)(?:&quot;|")[\s\S]{0,400}?turl(?:&quot;|")\s*:\s*(?:&quot;|")(.*?)(?:&quot;|")/g;
+      let m, n = 0;
+      while ((m = re.exec(html)) && n < 8) { add(un(m[1]), un(m[2]), 'Bing Immagini'); n++; }
+    } catch { /* se Bing non risponde, restano le altre fonti */ }
+  }
+
+  // 4) Con la chiave API: ricerca web mirata sulle pagine dei negozi/produttori
   if (getKey() && out.length < 4) {
     try {
       const r = await fetch('https://api.anthropic.com/v1/messages', {
