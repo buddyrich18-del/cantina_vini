@@ -1,0 +1,10 @@
+{
+	"appId": "it.cantina.vini",
+	"appName": "Cantina",
+	"webDir": "dist",
+	"plugins": {
+		"CapacitorHttp": {
+			"enabled": true
+		}
+	}
+}
