@@ -8,7 +8,7 @@ import { lookupProduct, marketPrice, fetchImageAsDataUrl } from './api.js';
 import { scanBarcode, isNative } from './scanner.js';
 import { describeWine, getKey, setKey } from './ai.js';
 import { parseList, parseJsonList, normName, nameSim } from './importer.js';
-import { lookupOnline } from './online.js';
+import { lookupOnline, searchPhotos } from './online.js';
 import { matchCellar, isClear } from './match.js';
 import { TextRecognition } from '@capacitor-mlkit/text-recognition';
 import { parseLabel, identifyLabel } from './label.js';
@@ -20,6 +20,17 @@ const $app = document.getElementById('app');
 // ---------- utilità ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const eur = (n) => (n == null || isNaN(n) ? '—' : n.toLocaleString('it-IT', { style: 'currency', currency: 'EUR' }));
+// Formato bottiglia: "50cl", "1,5L", "[0,75]" -> "0,5 L", "1,5 L", "0,75 L"
+const SIZES = ['0,375', '0,5', '0,75', '1,5', '3,0', '6,0'];
+const normSize = (v) => {
+  const t = String(v || '').toLowerCase().replace(/[\[\]\s]/g, '').replace(',', '.');
+  const m = t.match(/^(\d+(?:\.\d+)?)(cl|ml|l|lt)?$/);
+  if (!m) return String(v || '').trim();
+  let n = parseFloat(m[1]);
+  if (m[2] === 'cl') n /= 100; else if (m[2] === 'ml') n /= 1000; else if (!m[2] && n > 20) n /= 100;
+  const x = (Math.round(n * 1000) / 1000).toString().replace('.', ',');
+  return (x.includes(',') ? x : x + ',0') + ' L';
+};
 const num = (v) => { const n = parseFloat(String(v).replace(',', '.')); return isNaN(n) ? null : n; };
 const host = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return u; } };
 
@@ -120,10 +131,11 @@ async function openSheet(ctx) {
   const isNew = !ctx.wine;
   const f = {
     photo: w.photo || '', name: w.name || '', producer: w.producer || '', vintage: w.vintage || '',
-    type: w.type || 'Rosso', location: w.location || '', rating: w.rating || 0,
+    type: w.type || 'Rosso', location: w.location || '', size: normSize(w.size) || '0,75 L', rating: w.rating || 0,
     drinkFrom: w.drinkFrom || '', drinkTo: w.drinkTo || '', notes: w.notes || '', pairing: w.pairing || '',
     grapes: w.grapes || '', area: w.area || '', abv: w.abv || '', sources: w.sources || [],
     marketPrice: w.marketPrice ?? null, marketN: w.marketN ?? 0, photoUrl: '',
+    mprice: w.marketPrice != null ? String(w.marketPrice).replace('.', ',') : '',
     qty: ctx.fromScan || isNew || ctx.defaultQty ? '1' : '0', price: '',
   };
   if (ctx.prefill) {
@@ -166,11 +178,13 @@ async function openSheet(ctx) {
         <button class="btn ghost" id="f-web" type="button">🔎 Cerca info online</button>
         ${isNew ? '<button class="btn ghost" id="f-ocr" type="button">📷 Da etichetta</button>' : ''}
       </div>
+      <div class="row" style="margin-top:8px"><button class="btn ghost" id="f-img" type="button">🖼 Cerca foto online</button></div>
       ${barcode ? `<div class="note">Codice ${esc(barcode)} · <span id="f-src">${esc(ctx.lookup || '')}</span></div>` : ''}
       <div class="row">
         <div><label>Annata</label><input id="f-vintage" inputmode="numeric" maxlength="4" list="vlist" value="${esc(f.vintage)}" /><datalist id="vlist">${vintages.map((v) => `<option value="${esc(v)}">`).join('')}</datalist></div>
         <div><label>Tipo</label><select id="f-type">${TYPES.map((t) => `<option ${t === f.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
       </div>
+      <label>Formato bottiglia</label><select id="f-size">${[...new Set([...SIZES.map((x) => x + ' L'), f.size])].map((x) => `<option ${x === f.size ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>
       <label>Posizione in cantina</label><input id="f-location" value="${esc(f.location)}" placeholder="Es. Scaffale 2, fila 3" />
 
       <h2>Movimento</h2>
@@ -180,6 +194,7 @@ async function openSheet(ctx) {
           <div class="stepper"><button id="q-minus" type="button">−</button><input id="f-qty" inputmode="numeric" value="${esc(f.qty)}" /><button id="q-plus" type="button">+</button></div></div>
         <div id="price-box" style="${mode === 'carico' ? '' : 'display:none'}"><label>Prezzo pagato (€)</label><input id="f-price" inputmode="decimal" value="${esc(f.price)}" placeholder="${f.marketPrice != null ? String(f.marketPrice).replace('.', ',') : '0,00'}" /></div>
       </div>
+      <label>Prezzo medio / valore stimato (€)</label><input id="f-mprice" inputmode="decimal" value="${esc(f.mprice)}" placeholder="Es. 45" />
       <div class="note" id="f-market">${f.marketPrice != null ? `Prezzo medio indicativo: <b>${eur(f.marketPrice)}</b> (${f.marketN ? f.marketN + ' rilevazioni' : 'stima da fonti online'})` : barcode ? 'Prezzo di mercato non disponibile per questo codice.' : ''}</div>
 
       <h2>Scheda</h2>
@@ -204,8 +219,8 @@ async function openSheet(ctx) {
     const v = (id) => (bg.querySelector(id) ? bg.querySelector(id).value : null);
     const set = (k, id, trim = true) => { const x = v(id); if (x !== null) f[k] = trim ? x.trim() : x; };
     set('name', '#f-name'); set('producer', '#f-producer'); set('vintage', '#f-vintage'); set('type', '#f-type', false);
-    set('location', '#f-location'); set('drinkFrom', '#f-from'); set('drinkTo', '#f-to'); set('notes', '#f-notes'); set('pairing', '#f-pairing');
-    set('grapes', '#f-grapes'); set('area', '#f-area'); set('abv', '#f-abv'); set('qty', '#f-qty'); set('price', '#f-price');
+    set('location', '#f-location'); set('size', '#f-size', false); set('drinkFrom', '#f-from'); set('drinkTo', '#f-to'); set('notes', '#f-notes'); set('pairing', '#f-pairing');
+    set('grapes', '#f-grapes'); set('area', '#f-area'); set('abv', '#f-abv'); set('qty', '#f-qty'); set('price', '#f-price'); set('mprice', '#f-mprice');
   };
 
   // Info trovate online (solo nei campi ancora vuoti).
@@ -218,16 +233,16 @@ async function openSheet(ctx) {
     if (!auto) toast('Cerco online…');
     let r = null;
     try { r = await lookupOnline({ name: f.name, producer: f.producer, vintage: f.vintage }); }
-    catch (e) { webBusy = false; if (!auto) toast(e.message === 'BADKEY' ? 'Chiave API non valida' : 'Ricerca non riuscita'); return; }
+    catch (e) { webBusy = false; if (!auto) toast(e.message === 'BADKEY' ? 'Chiave API non valida' : /^API/.test(e.message) ? e.message : 'Ricerca non riuscita'); return; }
     webBusy = false;
     if (closed) return;
     if (!r) { if (!auto) toast('Non ho trovato informazioni affidabili'); return; }
     read();
     for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (r[k] && !f[k]) f[k] = r[k];
-    if (r.marketPrice != null && f.marketPrice == null) { f.marketPrice = r.marketPrice; f.marketN = 0; }
+    if (r.marketPrice != null && f.marketPrice == null && !f.mprice) { f.marketPrice = r.marketPrice; f.marketN = 0; f.mprice = String(r.marketPrice).replace('.', ','); }
     f.sources = [...new Set([...(f.sources || []), ...(r.sources || [])])];
     draw();
-    toast(`Info trovate (${r.via})`);
+    toast(r.warn ? `Solo Wikipedia: ${r.warn}` : `Info trovate (${r.via})`);
   }
 
   function wire() {
@@ -235,6 +250,22 @@ async function openSheet(ctx) {
     q('#f-x').onclick = close;
     q('#f-photo').onclick = async () => { read(); const p = await pickPhoto(); if (p) { f.photo = p; draw(); } };
     q('#f-web').onclick = () => runWeb(false);
+    q('#f-img').onclick = async () => {
+      read();
+      if (!f.name) { toast('Inserisci prima il nome del vino'); return; }
+      toast('Cerco foto online…');
+      let c = [];
+      try { c = await searchPhotos({ name: f.name, producer: f.producer, vintage: f.vintage, barcode }); }
+      catch (e) { toast(e.message === 'BADKEY' ? 'Chiave API non valida' : 'Ricerca foto non riuscita'); return; }
+      if (closed) return;
+      if (!c.length) { toast(getKey() ? 'Nessuna foto trovata: scatta o scegli dalla galleria' : 'Nessuna foto trovata. Con la chiave API la ricerca è più ampia'); return; }
+      const url = await pickPhotoOnline(c);
+      if (!url || closed) return;
+      toast('Scarico la foto…');
+      const d = await remotePhoto(url);
+      if (d) { f.photo = d; f.photoUrl = ''; } else { f.photoUrl = url; toast('Foto non scaricabile ora: la riprovo al salvataggio'); }
+      draw();
+    };
     if (q('#f-ocr')) q('#f-ocr').onclick = async () => {
       read();
       const r = await labelScan();
@@ -271,13 +302,16 @@ async function openSheet(ctx) {
       const now = Date.now();
       if (!target) target = { id: uid(), barcode, qty: 0, createdAt: now };
       Object.assign(target, {
-        name: f.name, producer: f.producer, vintage: f.vintage, type: f.type, location: f.location,
+        name: f.name, producer: f.producer, vintage: f.vintage, type: f.type, location: f.location, size: f.size,
         rating: f.rating, drinkFrom: f.drinkFrom, drinkTo: f.drinkTo, notes: f.notes, pairing: f.pairing,
         grapes: f.grapes, area: f.area, abv: f.abv, sources: f.sources || [], updatedAt: now,
       });
       target.photo = f.photo || target.photo || '';
       if (!target.photo && f.photoUrl) target.photo = (await fetchImageAsDataUrl(f.photoUrl)) || f.photoUrl;
-      if (f.marketPrice != null) Object.assign(target, { marketPrice: f.marketPrice, marketN: f.marketN, marketAt: now });
+      const mp2 = num(f.mprice || '');
+      if (mp2 != null && mp2 !== target.marketPrice) Object.assign(target, { marketPrice: mp2, marketN: 0, marketAt: now, marketManual: true });
+      else if (mp2 == null && !f.mprice) { if (target.marketManual || (f.marketPrice == null && target.marketPrice != null)) Object.assign(target, { marketPrice: null, marketN: 0, marketManual: false }); }
+      else if (f.marketPrice != null && !target.marketManual) Object.assign(target, { marketPrice: f.marketPrice, marketN: f.marketN, marketAt: now });
       const delta = mode === 'carico' ? qty : -qty;
       target.qty += delta;
       await put('wines', target);
@@ -301,11 +335,32 @@ async function openSheet(ctx) {
       if (!f.producer) f.producer = info.producer;
       if (!f.photo) f.photoUrl = info.photoUrl;
     }
-    if (mp) { f.marketPrice = mp.price; f.marketN = mp.n; }
+    if (mp) { f.marketPrice = mp.price; f.marketN = mp.n; if (!f.mprice) f.mprice = String(mp.price).replace('.', ','); }
     ctx.lookup = needInfo ? (info ? `dati da ${info.source}` : 'non trovata online: inserisci i dati') : '';
     draw();
   }
   if (ctx.autoInfo && f.name) runWeb(true);
+}
+
+// Scelta tra le foto trovate online. Restituisce l'URL scelto oppure null.
+function pickPhotoOnline(cands) {
+  return new Promise((res) => {
+    const bg = document.createElement('div');
+    bg.className = 'sheet-bg';
+    bg.innerHTML = `<div class="sheet"><div class="sheet-head"><span class="sheet-title">Quale foto?</span><button id="ph-x" type="button" aria-label="Chiudi">✕</button></div>
+      <div class="note" style="margin-bottom:8px">Tocca quella giusta. Controlla che sia la stessa etichetta.</div>
+      <div class="imggrid">${cands.map((c, i) => `<button type="button" data-i="${i}" title="${esc(c.src)}"><img src="${esc(c.thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.closest('button').style.display='none'" /></button>`).join('')}</div>
+      <div class="note">Fonti: ${[...new Set(cands.map((c) => c.src))].join(' · ')}</div></div>`;
+    document.body.appendChild(bg);
+    const done = (v) => { const k = backStack.indexOf(back); if (k >= 0) backStack.splice(k, 1); bg.remove(); res(v); };
+    const back = () => done(null);
+    backStack.push(back);
+    bg.onclick = (e) => {
+      const b = e.target.closest('button');
+      if (b && b.dataset.i != null) return done(cands[+b.dataset.i].url);
+      if (e.target === bg || (b && b.id === 'ph-x')) done(null);
+    };
+  });
 }
 
 // ---------- foto etichetta: riconosce prima le bottiglie già in cantina ----------
@@ -384,7 +439,7 @@ function viewCantina() {
       const p = shownPrice(w);
       const win = w.drinkFrom || w.drinkTo ? ` · ${w.drinkFrom || '…'}–${w.drinkTo || '…'}` : '';
       return `<div class="card" data-id="${w.id}"><div class="thumb" style="${w.photo ? `background-image:url('${esc(w.photo)}')` : ''}">${w.photo ? '' : glass(w.type, 46)}</div>
-        <div class="grow"><div class="ttl">${esc(w.name)}</div><div class="sub">${esc([w.producer, w.vintage, w.size].filter(Boolean).join(' · '))}</div>
+        <div class="grow"><div class="ttl">${esc(w.name)}</div><div class="sub">${esc([w.producer, w.vintage, normSize(w.size) && normSize(w.size) !== '0,75 L' ? normSize(w.size) : ''].filter(Boolean).join(' · '))}</div>
         <div class="sub">${p != null ? eur(p) : 'prezzo n.d.'}${esc(win)}${w.location ? ' · ' + esc(w.location) : ''}</div></div><div class="qty">${w.qty}</div></div>`;
     }).join('') : `<div class="empty">${S.wines.length ? 'Nessun risultato.' : 'La cantina è vuota.<br>Scansiona una bottiglia o aggiungila a mano.'}</div>`}`;
 }
@@ -570,13 +625,13 @@ async function updateAllInfo() {
     ? `Cerco online le info di ${todo.length} vini (ricerca web con la tua chiave API, circa ${(todo.length * 0.02).toFixed(2).replace('.', ',')} $).\nCompilo solo i campi vuoti; ciò che hai scritto non viene toccato.`
     : `Cerco online le info di ${todo.length} vini senza chiave API: uso Wikipedia, quindi solo informazioni generali sulla denominazione o sul vitigno (non sulla singola etichetta). Per dati specifici e prezzi serve la chiave API.\nCompilo solo i campi vuoti.`;
   if (!confirm(msg + '\n\nProcedere?')) return;
-  let ok = 0, bad = false;
+  let ok = 0, bad = false, lastErr = '';
   for (let i = 0; i < todo.length; i++) {
     const w = todo[i];
     toast(`Info ${i + 1}/${todo.length}: ${w.name}`);
     let r = null;
     try { r = await lookupOnline({ name: w.name, producer: w.producer, vintage: w.vintage }); }
-    catch (e) { if (e.message === 'BADKEY') { bad = true; break; } continue; }
+    catch (e) { if (e.message === 'BADKEY') { bad = true; break; } lastErr = e.message; continue; }
     if (!r) continue;
     let changed = false;
     for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (r[k] && !w[k]) { w[k] = r[k]; changed = true; }
@@ -586,14 +641,14 @@ async function updateAllInfo() {
     if (changed) { w.updatedAt = Date.now(); await put('wines', w); ok++; }
   }
   await refresh();
-  toast(bad ? 'Chiave API non valida' : `Schede aggiornate: ${ok} su ${todo.length}`);
+  toast(bad ? 'Chiave API non valida' : `Schede aggiornate: ${ok} su ${todo.length}${ok < todo.length && lastErr ? ' · ' + lastErr : ''}`);
 }
 
 // ---------- prezzi, backup ----------
 async function updateAllPrices() {
   const key = !!getKey();
-  const byBarcode = S.wines.filter((w) => w.barcode);
-  const byName = key ? S.wines.filter((w) => !w.barcode) : [];
+  const byBarcode = S.wines.filter((w) => w.barcode && !w.marketManual);
+  const byName = key ? S.wines.filter((w) => !w.barcode && !w.marketManual) : [];
   const list = [...byBarcode, ...byName];
   if (!list.length) { toast(key ? 'Nessun vino in cantina' : 'Nessun vino con codice a barre: per cercare i prezzi dal nome serve la chiave API (Altro)'); return; }
   if (byName.length && !confirm(`Cerco il prezzo online per nome di ${byName.length} vini senza codice a barre.\nCon la chiave API costa circa ${(byName.length * 0.02).toFixed(2).replace('.', ',')} $. Procedere?`)) return;
@@ -607,7 +662,7 @@ async function updateAllPrices() {
       try { const r = await lookupOnline({ name: w.name, producer: w.producer, vintage: w.vintage }); if (r && r.marketPrice != null) mp = { price: r.marketPrice, n: 0 }; }
       catch (e) { if (e.message === 'BADKEY') { toast('Chiave API non valida'); break; } }
     }
-    if (mp) { Object.assign(w, { marketPrice: mp.price, marketN: mp.n, marketAt: Date.now() }); await put('wines', w); ok++; }
+    if (mp && !w.marketManual) { Object.assign(w, { marketPrice: mp.price, marketN: mp.n, marketAt: Date.now() }); await put('wines', w); ok++; }
   }
   await refresh(); toast(`Prezzi aggiornati: ${ok} su ${list.length}`);
 }
@@ -664,10 +719,10 @@ async function importItems({ items, skipped }) {
   if (!confirm(`Trovate ${items.length} voci.\n${fresh.length} nuove (${bottles} bottiglie).${upd.length ? `\n${upd.length} già presenti: aggiorno i dati, le quantità restano.` : ''}${skipped.length ? `\n${skipped.length} righe non lette.` : ''}${nph ? `\n${nph} foto da scaricare (serve internet).` : ''}\n\nProcedere?`)) return;
   const now = Date.now();
   const fill = (w, it) => {
-    w.producer = it.producer || w.producer || ''; w.name = it.name; w.size = it.size || w.size || '';
+    w.producer = it.producer || w.producer || ''; w.name = it.name; w.size = normSize(it.size) || w.size || '';
     if (it.type && (it.type !== 'Altro' || !w.type || w.type === 'Altro')) w.type = it.type;
     for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (it[k]) w[k] = it[k];
-    if (it.marketPrice != null) { w.marketPrice = it.marketPrice; w.marketN = 0; w.marketAt = now; }
+    if (it.marketPrice != null && !w.marketManual) { w.marketPrice = it.marketPrice; w.marketN = 0; w.marketAt = now; }
     if (it.sources.length) w.sources = it.sources;
     w.updatedAt = now;
   };
