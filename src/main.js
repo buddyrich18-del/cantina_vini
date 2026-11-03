@@ -154,6 +154,7 @@ async function openSheet(ctx) {
     const hist = ctx.wine ? S.moves.filter((m) => m.wineId === ctx.wine.id).sort((a, b) => b.ts - a.ts).slice(0, 8) : [];
     bg.innerHTML = `<div class="sheet">
       <div class="sheet-head"><span class="sheet-title">${glass(f.type, 30)}<span style="overflow:hidden;text-overflow:ellipsis">${esc(f.name || 'Nuova bottiglia')}</span></span><button id="f-x" type="button" aria-label="Chiudi">✕</button></div>
+      <div class="sheet-body">
       <div class="row" style="align-items:flex-start">
         <button class="photo" id="f-photo" style="flex:none;${f.photo || f.photoUrl ? `background-image:url('${esc(f.photo || f.photoUrl)}')` : ''}">${f.photo || f.photoUrl ? '' : '📷<br>Aggiungi foto'}</button>
         <div style="flex:1">
@@ -195,7 +196,7 @@ async function openSheet(ctx) {
 
       <div style="margin-top:18px" class="row"><button class="btn ghost" id="f-cancel">Annulla</button><button class="btn" id="f-save">${ctx.wine && !ctx.fromScan ? 'Salva' : 'Conferma'}</button></div>
       ${ctx.wine ? '<div style="margin-top:10px"><button class="btn danger" id="f-del">Elimina vino</button></div>' : ''}
-    </div>`;
+    </div></div>`;
     wire();
   };
 
@@ -312,9 +313,9 @@ function pickCandidate(cands) {
   return new Promise((res) => {
     const bg = document.createElement('div');
     bg.className = 'sheet-bg';
-    bg.innerHTML = `<div class="sheet"><div class="sheet-head"><span class="sheet-title">Quale bottiglia?</span><button id="pk-x" type="button" aria-label="Chiudi">✕</button></div>
+    bg.innerHTML = `<div class="sheet"><div class="sheet-head"><span class="sheet-title">Quale bottiglia?</span><button id="pk-x" type="button" aria-label="Chiudi">✕</button></div><div class="sheet-body">
       ${cands.map((c, i) => `<div class="card" data-i="${i}"><div class="thumb">${glass(c.w.type, 46)}</div><div class="grow"><div class="ttl">${esc(c.w.name)}</div><div class="sub">${esc([c.w.producer, c.w.vintage].filter(Boolean).join(' · '))} · ${c.w.qty} bott.</div></div></div>`).join('')}
-      <button class="btn ghost" id="pk-new" style="margin-top:10px" type="button">Nessuna: è una bottiglia nuova</button></div>`;
+      <button class="btn ghost" id="pk-new" style="margin-top:10px" type="button">Nessuna: è una bottiglia nuova</button></div></div>`;
     document.body.appendChild(bg);
     const done = (v) => { bg.remove(); res(v); };
     bg.onclick = (e) => {
@@ -490,6 +491,7 @@ function viewMore() {
   return `<h1>Altro</h1>
     <div class="note">Il valore usa il prezzo medio di mercato (Open Prices) quando esiste, altrimenti la media di quanto hai pagato.</div>
     <div style="display:grid;gap:10px;margin-top:10px">
+      <button class="btn" id="updi">🔎 Aggiorna info vini dal web</button>
       <button class="btn ghost" id="upd">Aggiorna prezzi di mercato</button>
       <button class="btn ghost" id="exj">Esporta backup (JSON, con foto)</button>
       <button class="btn ghost" id="exc">Esporta elenco (CSV)</button>
@@ -546,11 +548,43 @@ function bind() {
     $('#keysave').onclick = () => { setKey($('#key').value); toast('Chiave salvata'); };
     $('#keydel').onclick = () => { setKey(''); render(); toast('Chiave rimossa'); };
     $('#upd').onclick = updateAllPrices;
+    $('#updi').onclick = updateAllInfo;
     $('#exj').onclick = exportJson;
     $('#exc').onclick = exportCsv;
     $('#imp').onclick = importJson;
     $('#imt').onclick = importTxt;
   }
+}
+
+// Cerca sul web (con chiave API: ricerca mirata; senza: Wikipedia) e completa le schede dei vini in cantina.
+async function updateAllInfo() {
+  const key = !!getKey();
+  const list = S.wines.filter((w) => w.qty > 0 || true);
+  if (!list.length) { toast('Nessun vino in cantina'); return; }
+  const need = (w) => !w.grapes || !w.area || !w.notes || !w.pairing || w.marketPrice == null;
+  const todo = list.filter(need);
+  if (!todo.length) { toast('Tutte le schede sono già complete'); return; }
+  const msg = key
+    ? `Cerco online le info di ${todo.length} vini (ricerca web con la tua chiave API, circa ${(todo.length * 0.02).toFixed(2).replace('.', ',')} $).\nCompilo solo i campi vuoti; ciò che hai scritto non viene toccato.`
+    : `Cerco online le info di ${todo.length} vini senza chiave API: uso Wikipedia, quindi solo informazioni generali sulla denominazione o sul vitigno (non sulla singola etichetta). Per dati specifici e prezzi serve la chiave API.\nCompilo solo i campi vuoti.`;
+  if (!confirm(msg + '\n\nProcedere?')) return;
+  let ok = 0, bad = false;
+  for (let i = 0; i < todo.length; i++) {
+    const w = todo[i];
+    toast(`Info ${i + 1}/${todo.length}: ${w.name}`);
+    let r = null;
+    try { r = await lookupOnline({ name: w.name, producer: w.producer, vintage: w.vintage }); }
+    catch (e) { if (e.message === 'BADKEY') { bad = true; break; } continue; }
+    if (!r) continue;
+    let changed = false;
+    for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (r[k] && !w[k]) { w[k] = r[k]; changed = true; }
+    if (r.marketPrice != null && w.marketPrice == null) { w.marketPrice = r.marketPrice; w.marketN = 0; w.marketAt = Date.now(); changed = true; }
+    const src = [...new Set([...(w.sources || []), ...(r.sources || [])])];
+    if (src.length !== (w.sources || []).length) { w.sources = src; changed = true; }
+    if (changed) { w.updatedAt = Date.now(); await put('wines', w); ok++; }
+  }
+  await refresh();
+  toast(bad ? 'Chiave API non valida' : `Schede aggiornate: ${ok} su ${todo.length}`);
 }
 
 // ---------- prezzi, backup ----------
