@@ -176,7 +176,7 @@ async function openSheet(ctx) {
       <div class="seg" id="f-mode"><button data-m="carico" class="${mode === 'carico' ? 'on' : ''}">Carico</button><button data-m="scarico" class="${mode === 'scarico' ? 'on' : ''}">Scarico</button></div>
       <div class="row" style="margin-top:10px;align-items:flex-end">
         <div><label>Bottiglie${ctx.wine ? ` (ora ${ctx.wine.qty})` : ''}</label>
-          <div class="stepper"><button id="q-" type="button">−</button><input id="f-qty" inputmode="numeric" value="${esc(f.qty)}" /><button id="q+" type="button">+</button></div></div>
+          <div class="stepper"><button id="q-minus" type="button">−</button><input id="f-qty" inputmode="numeric" value="${esc(f.qty)}" /><button id="q-plus" type="button">+</button></div></div>
         <div id="price-box" style="${mode === 'carico' ? '' : 'display:none'}"><label>Prezzo pagato (€)</label><input id="f-price" inputmode="decimal" value="${esc(f.price)}" placeholder="${f.marketPrice != null ? String(f.marketPrice).replace('.', ',') : '0,00'}" /></div>
       </div>
       <div class="note" id="f-market">${f.marketPrice != null ? `Prezzo medio indicativo: <b>${eur(f.marketPrice)}</b> (${f.marketN ? f.marketN + ' rilevazioni' : 'stima da fonti online'})` : barcode ? 'Prezzo di mercato non disponibile per questo codice.' : ''}</div>
@@ -247,8 +247,8 @@ async function openSheet(ctx) {
       if (f.name) runWeb(true);
     };
     q('#f-mode').onclick = (e) => { const m = e.target.dataset.m; if (m) { read(); mode = m; draw(); } };
-    q('#q-').onclick = () => { const i = q('#f-qty'); i.value = Math.max(0, (parseInt(i.value) || 0) - 1); };
-    q('#q+').onclick = () => { const i = q('#f-qty'); i.value = (parseInt(i.value) || 0) + 1; };
+    q('#q-minus').onclick = () => { const i = q('#f-qty'); i.value = Math.max(0, (parseInt(i.value) || 0) - 1); };
+    q('#q-plus').onclick = () => { const i = q('#f-qty'); i.value = (parseInt(i.value) || 0) + 1; };
     q('#f-stars').onclick = (e) => { const s = +e.target.dataset.s; if (s) { read(); f.rating = f.rating === s ? 0 : s; draw(); } };
     q('#f-cancel').onclick = close;
     if (q('#f-del')) q('#f-del').onclick = async () => {
