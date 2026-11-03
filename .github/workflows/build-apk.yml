@@ -1,0 +1,56 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Accetta licenze Android SDK (SDK già presente sul runner)
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Installa dipendenze
+        run: npm ci
+
+      - name: Build web e sync Android
+        run: npm run sync
+
+      - name: Build APK (debug, installabile)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rinomina APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk cantina.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cantina-apk
+          path: cantina.apk
+
+      # Pubblica anche una Release con l'APK scaricabile dal telefono
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Cantina build ${{ github.run_number }}
+          files: cantina.apk
