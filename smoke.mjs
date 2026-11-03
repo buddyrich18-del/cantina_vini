@@ -1,0 +1,14 @@
+import { chromium } from 'playwright';
+const b = await chromium.launch(); const p = await b.newPage({viewport:{width:390,height:800}});
+const errs=[]; p.on('pageerror',e=>errs.push(e.message));
+await p.goto('http://localhost:4173/'); await p.waitForTimeout(800);
+await p.click('#addman').catch(async()=>{await p.click('#addman2')});
+await p.waitForSelector('#f-save');
+await p.fill('#f-name','Test vino'); await p.click('#q-plus'); await p.click('#f-save'); await p.waitForTimeout(600);
+console.log('sheet aperta dopo salva:', await p.locator('.sheet-bg').count());
+console.log('card:', await p.locator('.card').count());
+await p.locator('.card').first().click(); await p.waitForSelector('#f-cancel'); await p.click('#f-cancel'); await p.waitForTimeout(300);
+console.log('dopo annulla:', await p.locator('.sheet-bg').count());
+await p.locator('.card').first().click(); await p.waitForSelector('#f-del'); p.on('dialog',d=>d.accept()); await p.click('#f-del'); await p.waitForTimeout(600);
+console.log('dopo elimina: sheet',await p.locator('.sheet-bg').count(),'card',await p.locator('.card').count());
+console.log('errori:',errs); await b.close();

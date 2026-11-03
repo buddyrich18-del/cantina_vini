@@ -65,3 +65,29 @@ export function parseList(text) {
   }
   return { items, skipped };
 }
+
+// Elenco in JSON: { "bottiglie": [ { produttore, vino, annata, qta, formato, posizione, tipo, uve, zona, alcol, note,
+//   abbinamenti[], bere_da, bere_entro, prezzo_eur, foto_url, fonti[] } ] }  (oppure direttamente l'array)
+export function parseJsonList(d) {
+  const arr = Array.isArray(d) ? d : Array.isArray(d && d.bottiglie) ? d.bottiglie : null;
+  if (!arr) return null;
+  const items = [], skipped = [];
+  const s = (v) => (v == null ? '' : String(v).trim());
+  for (const o of arr) {
+    const name = s(o.vino || o.nome), producer = s(o.produttore);
+    const qty = parseInt(o.qta ?? o.quantita ?? 1, 10);
+    if (!name || !(qty > 0)) { skipped.push(JSON.stringify(o).slice(0, 60)); continue; }
+    const vintage = s(o.annata).toUpperCase();
+    const tipo = typeOf(o.tipo);
+    const price = parseFloat(String(o.prezzo_eur ?? '').replace(',', '.'));
+    items.push({
+      producer, name, vintage: /^((19|20)\d\d|NV)$/.test(vintage) ? vintage : '', qty, size: s(o.formato).replace(/^\[|\]$/g, ''), location: s(o.posizione),
+      type: tipo || guessType(`${producer} ${name}`, findStyle(`${producer} ${name}`)) || 'Altro',
+      grapes: s(o.uve), area: s(o.zona), notes: s(o.note), abv: s(o.alcol),
+      pairing: Array.isArray(o.abbinamenti) ? o.abbinamenti.join(', ') : s(o.abbinamenti),
+      drinkFrom: s(o.bere_da), drinkTo: s(o.bere_entro), marketPrice: price > 0 ? price : null,
+      sources: Array.isArray(o.fonti) ? o.fonti.filter(Boolean).map(String) : [], photoUrl: s(o.foto_url),
+    });
+  }
+  return { items, skipped };
+}

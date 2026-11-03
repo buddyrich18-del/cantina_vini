@@ -6,7 +6,7 @@ import { all, put, del, clear, uid } from './db.js';
 import { lookupProduct, marketPrice, fetchImageAsDataUrl } from './api.js';
 import { scanBarcode, isNative } from './scanner.js';
 import { describeWine, getKey, setKey } from './ai.js';
-import { parseList, normName, nameSim } from './importer.js';
+import { parseList, parseJsonList, normName, nameSim } from './importer.js';
 import { lookupOnline } from './online.js';
 import { matchCellar, isClear } from './match.js';
 import { TextRecognition } from '@capacitor-mlkit/text-recognition';
@@ -493,7 +493,7 @@ function viewMore() {
       <button class="btn ghost" id="upd">Aggiorna prezzi di mercato</button>
       <button class="btn ghost" id="exj">Esporta backup (JSON, con foto)</button>
       <button class="btn ghost" id="exc">Esporta elenco (CSV)</button>
-      <button class="btn ghost" id="imt">Importa elenco (TXT)</button>
+      <button class="btn ghost" id="imt">Importa elenco (TXT o JSON)</button>
       <button class="btn ghost" id="imp">Importa backup JSON</button>
     </div>
     <h2>Scheda sensoriale: chiave API (facoltativa)</h2>
@@ -555,13 +555,23 @@ function bind() {
 
 // ---------- prezzi, backup ----------
 async function updateAllPrices() {
-  const list = S.wines.filter((w) => w.barcode);
-  if (!list.length) { toast('Nessun vino con codice a barre'); return; }
+  const key = !!getKey();
+  const byBarcode = S.wines.filter((w) => w.barcode);
+  const byName = key ? S.wines.filter((w) => !w.barcode) : [];
+  const list = [...byBarcode, ...byName];
+  if (!list.length) { toast(key ? 'Nessun vino in cantina' : 'Nessun vino con codice a barre: per cercare i prezzi dal nome serve la chiave API (Altro)'); return; }
+  if (byName.length && !confirm(`Cerco il prezzo online per nome di ${byName.length} vini senza codice a barre.\nCon la chiave API costa circa ${(byName.length * 0.02).toFixed(2).replace('.', ',')} $. Procedere?`)) return;
   let ok = 0;
   for (let i = 0; i < list.length; i++) {
+    const w = list[i];
     toast(`Prezzi ${i + 1}/${list.length}…`);
-    const mp = await marketPrice(list[i].barcode);
-    if (mp) { Object.assign(list[i], { marketPrice: mp.price, marketN: mp.n, marketAt: Date.now() }); await put('wines', list[i]); ok++; }
+    let mp = null;
+    if (w.barcode) mp = await marketPrice(w.barcode);
+    if (!mp && key) {
+      try { const r = await lookupOnline({ name: w.name, producer: w.producer, vintage: w.vintage }); if (r && r.marketPrice != null) mp = { price: r.marketPrice, n: 0 }; }
+      catch (e) { if (e.message === 'BADKEY') { toast('Chiave API non valida'); break; } }
+    }
+    if (mp) { Object.assign(w, { marketPrice: mp.price, marketN: mp.n, marketAt: Date.now() }); await put('wines', w); ok++; }
   }
   await refresh(); toast(`Prezzi aggiornati: ${ok} su ${list.length}`);
 }
@@ -587,38 +597,60 @@ function exportCsv() {
 }
 function importTxt() {
   const i = document.createElement('input');
-  i.type = 'file'; i.accept = 'text/plain,.txt';
+  i.type = 'file'; i.accept = 'text/plain,application/json,.txt,.json';
   i.onchange = async () => {
     try {
-      const { items, skipped } = parseList(await i.files[0].text());
-      if (!items.length) { toast('Nessuna bottiglia trovata nel file'); return; }
-      const full = (x) => `${x.producer || ''} ${x.name}`;
-      const findSame = (it) => S.wines.find((w) => String(w.vintage || '') === it.vintage && (w.location || '') === it.location
-        && (normName(full(w)) === normName(full(it)) || nameSim(full(w), full(it)) >= 0.75));
-      const upd = [], fresh = [];
-      for (const it of items) { const ex = findSame(it); if (ex) upd.push([ex, it]); else fresh.push(it); }
-      const bottles = fresh.reduce((s, x) => s + x.qty, 0);
-      if (!confirm(`Trovate ${items.length} voci.\n${fresh.length} nuove (${bottles} bottiglie).${upd.length ? `\n${upd.length} già presenti: aggiorno i dati, le quantità restano.` : ''}${skipped.length ? `\n${skipped.length} righe non lette.` : ''}\n\nProcedere?`)) return;
-      const now = Date.now();
-      const fill = (w, it) => {
-        w.producer = it.producer || w.producer || ''; w.name = it.name; w.size = it.size || w.size || '';
-        if (it.type && (it.type !== 'Altro' || !w.type || w.type === 'Altro')) w.type = it.type;
-        for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (it[k]) w[k] = it[k];
-        if (it.marketPrice != null) { w.marketPrice = it.marketPrice; w.marketN = 0; w.marketAt = now; }
-        if (it.sources.length) w.sources = it.sources;
-        w.updatedAt = now;
-      };
-      for (const [w, it] of upd) { fill(w, it); await put('wines', w); }
-      for (const it of fresh) {
-        const w = { id: uid(), barcode: '', qty: it.qty, location: it.location, photo: '', rating: 0, createdAt: now };
-        fill(w, it);
-        await put('wines', w);
-        await put('moves', { id: uid(), wineId: w.id, ts: now, delta: it.qty, price: null });
-      }
-      await refresh(); toast(`Importate ${fresh.length} nuove, aggiornate ${upd.length}`);
+      const raw = await i.files[0].text();
+      let parsed = null;
+      if (/^\s*[\[{]/.test(raw)) { try { parsed = parseJsonList(JSON.parse(raw)); } catch { parsed = null; } }
+      await importItems(parsed || parseList(raw));
     } catch { toast('File non valido'); }
   };
   i.click();
+}
+// Foto remota -> miniatura salvata nell'app (resta disponibile offline).
+async function remotePhoto(url) {
+  try {
+    const blob = await (await fetch(url)).blob();
+    if (!blob.size || (blob.type && !/^image\//.test(blob.type))) return '';
+    return await resizeFile(new File([blob], 'bottiglia.jpg', { type: blob.type || 'image/jpeg' }), 700);
+  } catch { return ''; }
+}
+async function importItems({ items, skipped }) {
+  if (!items.length) { toast('Nessuna bottiglia trovata nel file'); return; }
+  const full = (x) => `${x.producer || ''} ${x.name}`;
+  const findSame = (it) => S.wines.find((w) => String(w.vintage || '') === it.vintage && (w.location || '') === it.location
+    && (normName(full(w)) === normName(full(it)) || nameSim(full(w), full(it)) >= 0.75));
+  const upd = [], fresh = [];
+  for (const it of items) { const ex = findSame(it); if (ex) upd.push([ex, it]); else fresh.push(it); }
+  const bottles = fresh.reduce((s, x) => s + x.qty, 0);
+  const nph = items.filter((x) => x.photoUrl).length;
+  if (!confirm(`Trovate ${items.length} voci.\n${fresh.length} nuove (${bottles} bottiglie).${upd.length ? `\n${upd.length} già presenti: aggiorno i dati, le quantità restano.` : ''}${skipped.length ? `\n${skipped.length} righe non lette.` : ''}${nph ? `\n${nph} foto da scaricare (serve internet).` : ''}\n\nProcedere?`)) return;
+  const now = Date.now();
+  const fill = (w, it) => {
+    w.producer = it.producer || w.producer || ''; w.name = it.name; w.size = it.size || w.size || '';
+    if (it.type && (it.type !== 'Altro' || !w.type || w.type === 'Altro')) w.type = it.type;
+    for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (it[k]) w[k] = it[k];
+    if (it.marketPrice != null) { w.marketPrice = it.marketPrice; w.marketN = 0; w.marketAt = now; }
+    if (it.sources.length) w.sources = it.sources;
+    w.updatedAt = now;
+  };
+  let n = 0, ph = 0;
+  const photo = async (w, it) => {
+    if (!it.photoUrl || w.photo) return;
+    const d = await remotePhoto(it.photoUrl);
+    if (d) { w.photo = d; ph++; }
+  };
+  const total = upd.length + fresh.length;
+  for (const [w, it] of upd) { toast(`Importo ${++n}/${total}…`); fill(w, it); await photo(w, it); await put('wines', w); }
+  for (const it of fresh) {
+    toast(`Importo ${++n}/${total}…`);
+    const w = { id: uid(), barcode: '', qty: it.qty, location: it.location, photo: '', rating: 0, createdAt: now };
+    fill(w, it); await photo(w, it);
+    await put('wines', w);
+    await put('moves', { id: uid(), wineId: w.id, ts: now, delta: it.qty, price: null });
+  }
+  await refresh(); toast(`Importate ${fresh.length} nuove, aggiornate ${upd.length}${nph ? ` · foto ${ph}/${nph}` : ''}`);
 }
 function importJson() {
   const i = document.createElement('input');
@@ -626,7 +658,7 @@ function importJson() {
   i.onchange = async () => {
     try {
       const d = JSON.parse(await i.files[0].text());
-      if (!Array.isArray(d.wines)) throw new Error();
+      if (!Array.isArray(d.wines)) { const pj = parseJsonList(d); if (pj) { await importItems(pj); return; } throw new Error(); }
       if (!confirm(`Importare ${d.wines.length} vini? I dati attuali verranno sostituiti.`)) return;
       await clear('wines'); await clear('moves');
       for (const w of d.wines) await put('wines', w);
