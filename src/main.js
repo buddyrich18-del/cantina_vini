@@ -2,6 +2,7 @@ import './style.css';
 import { Camera, CameraResultType, CameraSource } from '@capacitor/camera';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
+import { App as CapApp } from '@capacitor/app';
 import { all, put, del, clear, uid } from './db.js';
 import { lookupProduct, marketPrice, fetchImageAsDataUrl } from './api.js';
 import { scanBarcode, isNative } from './scanner.js';
@@ -113,6 +114,7 @@ async function labelScan() {
 
 // ---------- scheda bottiglia / carico-scarico ----------
 // ctx: { wine?, barcode?, fromScan?, mode?, lookup?, prefill?, defaultQty?, autoInfo? }
+const backStack = [];
 async function openSheet(ctx) {
   const w = ctx.wine || {};
   const isNew = !ctx.wine;
@@ -138,16 +140,14 @@ async function openSheet(ctx) {
   bg.className = 'sheet-bg';
   document.body.appendChild(bg);
 
-  // Uscita: tasto ✕, tocco fuori dalla scheda, tasto indietro di Android.
+  // Uscita: tasto ✕, tocco fuori dalla scheda, tasto indietro di Android (gestito in backStack).
   let closed = false;
-  history.pushState({ sheet: true }, '');
-  const onPop = () => { if (closed) return; closed = true; bg.remove(); };
-  window.addEventListener('popstate', onPop);
   const close = () => {
     if (closed) return;
-    closed = true; window.removeEventListener('popstate', onPop); bg.remove();
-    if (history.state && history.state.sheet) history.back();
+    closed = true; bg.remove();
+    const k = backStack.indexOf(close); if (k >= 0) backStack.splice(k, 1);
   };
+  backStack.push(close);
   bg.addEventListener('click', (e) => { if (e.target === bg) close(); });
 
   const draw = () => {
@@ -317,7 +317,9 @@ function pickCandidate(cands) {
       ${cands.map((c, i) => `<div class="card" data-i="${i}"><div class="thumb">${glass(c.w.type, 46)}</div><div class="grow"><div class="ttl">${esc(c.w.name)}</div><div class="sub">${esc([c.w.producer, c.w.vintage].filter(Boolean).join(' · '))} · ${c.w.qty} bott.</div></div></div>`).join('')}
       <button class="btn ghost" id="pk-new" style="margin-top:10px" type="button">Nessuna: è una bottiglia nuova</button></div></div>`;
     document.body.appendChild(bg);
-    const done = (v) => { bg.remove(); res(v); };
+    const done = (v) => { const k = backStack.indexOf(back); if (k >= 0) backStack.splice(k, 1); bg.remove(); res(v); };
+    const back = () => done(null);
+    backStack.push(back);
     bg.onclick = (e) => {
       const c = e.target.closest('.card');
       if (c) return done(cands[+c.dataset.i].w);
@@ -703,4 +705,13 @@ function importJson() {
   i.click();
 }
 
+// Tasto indietro di Android: chiude la scheda aperta; senza schede torna alla Cantina; solo da lì esce.
+if (isNative) {
+  CapApp.addListener('backButton', () => {
+    const top = backStack[backStack.length - 1];
+    if (top) return top();
+    if (S.tab !== 'cantina') { S.tab = 'cantina'; render(); return; }
+    CapApp.exitApp();
+  });
+}
 load().then(render);
