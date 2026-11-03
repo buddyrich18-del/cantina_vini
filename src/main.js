@@ -597,7 +597,7 @@ function exportCsv() {
 }
 function importTxt() {
   const i = document.createElement('input');
-  i.type = 'file'; i.accept = 'text/plain,application/json,.txt,.json';
+  i.type = 'file'; i.accept = '*/*'; // Android non riconosce sempre il tipo .json/.txt: il contenuto lo controllo io
   i.onchange = async () => {
     try {
       const raw = await i.files[0].text();
@@ -654,7 +654,7 @@ async function importItems({ items, skipped }) {
 }
 function importJson() {
   const i = document.createElement('input');
-  i.type = 'file'; i.accept = 'application/json,.json';
+  i.type = 'file'; i.accept = '*/*';
   i.onchange = async () => {
     try {
       const d = JSON.parse(await i.files[0].text());
