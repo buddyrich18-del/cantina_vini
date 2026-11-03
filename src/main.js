@@ -6,7 +6,9 @@ import { all, put, del, clear, uid } from './db.js';
 import { lookupProduct, marketPrice, fetchImageAsDataUrl } from './api.js';
 import { scanBarcode, isNative } from './scanner.js';
 import { describeWine, getKey, setKey } from './ai.js';
-import { parseList, normName } from './importer.js';
+import { parseList, normName, nameSim } from './importer.js';
+import { lookupOnline } from './online.js';
+import { matchCellar, isClear } from './match.js';
 import { TextRecognition } from '@capacitor-mlkit/text-recognition';
 import { parseLabel, identifyLabel } from './label.js';
 
@@ -18,6 +20,15 @@ const $app = document.getElementById('app');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const eur = (n) => (n == null || isNaN(n) ? '—' : n.toLocaleString('it-IT', { style: 'currency', currency: 'EUR' }));
 const num = (v) => { const n = parseFloat(String(v).replace(',', '.')); return isNaN(n) ? null : n; };
+const host = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return u; } };
+
+// Bicchiere colorato per tipo: rosso, giallo (bianco), rosa, oro con bollicine (spumante).
+const GLASS_COL = { Rosso: '#B3203F', Bianco: '#E6C03A', 'Rosé': '#F08A9E', Spumante: '#EBD27A', Altro: '#9A9093' };
+const glass = (type, h = 46) => {
+  const c = GLASS_COL[type] || GLASS_COL.Altro;
+  const bub = type === 'Spumante' ? '<circle cx="19" cy="24" r="1.3" fill="#fff"/><circle cx="25.5" cy="19" r="1.1" fill="#fff"/><circle cx="22" cy="29" r="1" fill="#fff"/>' : '';
+  return `<svg viewBox="0 0 44 64" height="${h}" width="${Math.round(h * 44 / 64)}" aria-hidden="true"><path d="M9 4H35C35 24 30 36 22 36C14 36 9 24 9 4Z" fill="currentColor" fill-opacity=".1" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M10.2 16H33.8C33 28 29 35 22 35C15 35 11 28 10.2 16Z" fill="${c}"/>${bub}<path d="M22 36V56M13 59H31" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>`;
+};
 let toastT;
 function toast(msg) {
   const t = document.getElementById('toast');
@@ -101,14 +112,17 @@ async function labelScan() {
 }
 
 // ---------- scheda bottiglia / carico-scarico ----------
-// ctx: { wine?, barcode?, fromScan?, mode?, lookup? }
+// ctx: { wine?, barcode?, fromScan?, mode?, lookup?, prefill?, defaultQty?, autoInfo? }
 async function openSheet(ctx) {
   const w = ctx.wine || {};
+  const isNew = !ctx.wine;
   const f = {
     photo: w.photo || '', name: w.name || '', producer: w.producer || '', vintage: w.vintage || '',
     type: w.type || 'Rosso', location: w.location || '', rating: w.rating || 0,
     drinkFrom: w.drinkFrom || '', drinkTo: w.drinkTo || '', notes: w.notes || '', pairing: w.pairing || '',
+    grapes: w.grapes || '', area: w.area || '', abv: w.abv || '', sources: w.sources || [],
     marketPrice: w.marketPrice ?? null, marketN: w.marketN ?? 0, photoUrl: '',
+    qty: ctx.fromScan || isNew || ctx.defaultQty ? '1' : '0', price: '',
   };
   if (ctx.prefill) {
     const p = ctx.prefill;
@@ -119,23 +133,37 @@ async function openSheet(ctx) {
   let mode = ctx.mode || 'carico';
   const barcode = ctx.barcode || w.barcode || '';
   const vintages = [...new Set(S.wines.filter((x) => x.barcode && x.barcode === barcode).map((x) => x.vintage).filter(Boolean))];
-  const isNew = !ctx.wine;
 
   const bg = document.createElement('div');
   bg.className = 'sheet-bg';
   document.body.appendChild(bg);
-  const close = () => bg.remove();
+
+  // Uscita: tasto ✕, tocco fuori dalla scheda, tasto indietro di Android.
+  let closed = false;
+  history.pushState({ sheet: true }, '');
+  const onPop = () => { if (closed) return; closed = true; bg.remove(); };
+  window.addEventListener('popstate', onPop);
+  const close = () => {
+    if (closed) return;
+    closed = true; window.removeEventListener('popstate', onPop); bg.remove();
+    if (history.state && history.state.sheet) history.back();
+  };
   bg.addEventListener('click', (e) => { if (e.target === bg) close(); });
 
   const draw = () => {
     const hist = ctx.wine ? S.moves.filter((m) => m.wineId === ctx.wine.id).sort((a, b) => b.ts - a.ts).slice(0, 8) : [];
     bg.innerHTML = `<div class="sheet">
+      <div class="sheet-head"><span class="sheet-title">${glass(f.type, 30)}<span style="overflow:hidden;text-overflow:ellipsis">${esc(f.name || 'Nuova bottiglia')}</span></span><button id="f-x" type="button" aria-label="Chiudi">✕</button></div>
       <div class="row" style="align-items:flex-start">
         <button class="photo" id="f-photo" style="flex:none;${f.photo || f.photoUrl ? `background-image:url('${esc(f.photo || f.photoUrl)}')` : ''}">${f.photo || f.photoUrl ? '' : '📷<br>Aggiungi foto'}</button>
         <div style="flex:1">
           <label style="margin-top:0">Nome</label><input id="f-name" value="${esc(f.name)}" placeholder="Es. Barolo Cannubi" />
           <label>Produttore</label><input id="f-producer" value="${esc(f.producer)}" />
         </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn ghost" id="f-web" type="button">🔎 Cerca info online</button>
+        ${isNew ? '<button class="btn ghost" id="f-ocr" type="button">📷 Da etichetta</button>' : ''}
       </div>
       ${barcode ? `<div class="note">Codice ${esc(barcode)} · <span id="f-src">${esc(ctx.lookup || '')}</span></div>` : ''}
       <div class="row">
@@ -148,17 +176,20 @@ async function openSheet(ctx) {
       <div class="seg" id="f-mode"><button data-m="carico" class="${mode === 'carico' ? 'on' : ''}">Carico</button><button data-m="scarico" class="${mode === 'scarico' ? 'on' : ''}">Scarico</button></div>
       <div class="row" style="margin-top:10px;align-items:flex-end">
         <div><label>Bottiglie${ctx.wine ? ` (ora ${ctx.wine.qty})` : ''}</label>
-          <div class="stepper"><button id="q-" type="button">−</button><input id="f-qty" inputmode="numeric" value="${ctx.fromScan || isNew ? 1 : 0}" /><button id="q+" type="button">+</button></div></div>
-        <div id="price-box" style="${mode === 'carico' ? '' : 'display:none'}"><label>Prezzo pagato (€)</label><input id="f-price" inputmode="decimal" placeholder="${f.marketPrice != null ? String(f.marketPrice).replace('.', ',') : '0,00'}" /></div>
+          <div class="stepper"><button id="q-" type="button">−</button><input id="f-qty" inputmode="numeric" value="${esc(f.qty)}" /><button id="q+" type="button">+</button></div></div>
+        <div id="price-box" style="${mode === 'carico' ? '' : 'display:none'}"><label>Prezzo pagato (€)</label><input id="f-price" inputmode="decimal" value="${esc(f.price)}" placeholder="${f.marketPrice != null ? String(f.marketPrice).replace('.', ',') : '0,00'}" /></div>
       </div>
-      <div class="note" id="f-market">${f.marketPrice != null ? `Prezzo medio di mercato: <b>${eur(f.marketPrice)}</b> (${f.marketN} rilevazioni)` : barcode ? 'Prezzo di mercato non disponibile per questo codice.' : ''}</div>
+      <div class="note" id="f-market">${f.marketPrice != null ? `Prezzo medio indicativo: <b>${eur(f.marketPrice)}</b> (${f.marketN ? f.marketN + ' rilevazioni' : 'stima da fonti online'})` : barcode ? 'Prezzo di mercato non disponibile per questo codice.' : ''}</div>
 
-      <h2>Dettagli</h2>
+      <h2>Scheda</h2>
+      <label>Uvaggio</label><input id="f-grapes" value="${esc(f.grapes)}" placeholder="Es. Nebbiolo 90%, Vespolina 10%" />
+      <div class="row"><div style="flex:2"><label>Zona / denominazione</label><input id="f-area" value="${esc(f.area)}" placeholder="Es. Piemonte, Ghemme DOCG" /></div><div><label>Alcol</label><input id="f-abv" value="${esc(f.abv)}" placeholder="14%" /></div></div>
       <label>Valutazione</label>
       <div class="stars" id="f-stars">${[1, 2, 3, 4, 5].map((i) => `<button type="button" data-s="${i}" class="${i <= f.rating ? 'on' : ''}">★</button>`).join('')}</div>
       <div class="row"><div><label>Da bere dal</label><input id="f-from" inputmode="numeric" maxlength="4" value="${esc(f.drinkFrom)}" /></div><div><label>entro il</label><input id="f-to" inputmode="numeric" maxlength="4" value="${esc(f.drinkTo)}" /></div></div>
-      <label>Note di degustazione</label><textarea id="f-notes">${esc(f.notes)}</textarea>
+      <label>Note di degustazione</label><textarea id="f-notes" style="min-height:96px">${esc(f.notes)}</textarea>
       <label>Abbinamenti</label><input id="f-pairing" value="${esc(f.pairing)}" placeholder="Es. brasato, formaggi stagionati" />
+      ${f.sources && f.sources.length ? `<div class="note">Fonti: ${f.sources.map((u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(host(u))}</a>`).join(' · ')}</div>` : ''}
 
       ${hist.length ? `<h2>Ultimi movimenti</h2>${hist.map((m) => `<div class="mv"><span>${new Date(m.ts).toLocaleDateString('it-IT')}</span><span class="${m.delta > 0 ? 'pos' : 'neg'}">${m.delta > 0 ? '+' : ''}${m.delta}${m.price != null ? ' · ' + eur(m.price) : ''}</span></div>`).join('')}` : ''}
 
@@ -169,16 +200,53 @@ async function openSheet(ctx) {
   };
 
   const read = () => {
-    const v = (id) => (bg.querySelector(id) ? bg.querySelector(id).value : '');
-    f.name = v('#f-name').trim(); f.producer = v('#f-producer').trim(); f.vintage = v('#f-vintage').trim();
-    f.type = v('#f-type'); f.location = v('#f-location').trim(); f.drinkFrom = v('#f-from').trim(); f.drinkTo = v('#f-to').trim();
-    f.notes = v('#f-notes').trim(); f.pairing = v('#f-pairing').trim();
+    const v = (id) => (bg.querySelector(id) ? bg.querySelector(id).value : null);
+    const set = (k, id, trim = true) => { const x = v(id); if (x !== null) f[k] = trim ? x.trim() : x; };
+    set('name', '#f-name'); set('producer', '#f-producer'); set('vintage', '#f-vintage'); set('type', '#f-type', false);
+    set('location', '#f-location'); set('drinkFrom', '#f-from'); set('drinkTo', '#f-to'); set('notes', '#f-notes'); set('pairing', '#f-pairing');
+    set('grapes', '#f-grapes'); set('area', '#f-area'); set('abv', '#f-abv'); set('qty', '#f-qty'); set('price', '#f-price');
   };
+
+  // Info trovate online (solo nei campi ancora vuoti).
+  let webBusy = false;
+  async function runWeb(auto) {
+    read();
+    if (!f.name) { if (!auto) toast('Inserisci prima il nome del vino'); return; }
+    if (webBusy) return;
+    webBusy = true;
+    if (!auto) toast('Cerco online…');
+    let r = null;
+    try { r = await lookupOnline({ name: f.name, producer: f.producer, vintage: f.vintage }); }
+    catch (e) { webBusy = false; if (!auto) toast(e.message === 'BADKEY' ? 'Chiave API non valida' : 'Ricerca non riuscita'); return; }
+    webBusy = false;
+    if (closed) return;
+    if (!r) { if (!auto) toast('Non ho trovato informazioni affidabili'); return; }
+    read();
+    for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (r[k] && !f[k]) f[k] = r[k];
+    if (r.marketPrice != null && f.marketPrice == null) { f.marketPrice = r.marketPrice; f.marketN = 0; }
+    f.sources = [...new Set([...(f.sources || []), ...(r.sources || [])])];
+    draw();
+    toast(`Info trovate (${r.via})`);
+  }
 
   function wire() {
     const q = (s) => bg.querySelector(s);
+    q('#f-x').onclick = close;
     q('#f-photo').onclick = async () => { read(); const p = await pickPhoto(); if (p) { f.photo = p; draw(); } };
-    q('#f-mode').onclick = (e) => { const m = e.target.dataset.m; if (m) { read(); const qv = q('#f-qty').value; mode = m; draw(); bg.querySelector('#f-qty').value = qv; } };
+    q('#f-web').onclick = () => runWeb(false);
+    if (q('#f-ocr')) q('#f-ocr').onclick = async () => {
+      read();
+      const r = await labelScan();
+      if (!r || closed) return;
+      if (r.photo) f.photo = r.photo;
+      if (!f.name && r.name) f.name = r.name;
+      if (!f.producer && r.producer) f.producer = r.producer;
+      if (!f.vintage && r.vintage) f.vintage = r.vintage;
+      if (r.type && TYPES.includes(r.type)) f.type = r.type;
+      draw();
+      if (f.name) runWeb(true);
+    };
+    q('#f-mode').onclick = (e) => { const m = e.target.dataset.m; if (m) { read(); mode = m; draw(); } };
     q('#q-').onclick = () => { const i = q('#f-qty'); i.value = Math.max(0, (parseInt(i.value) || 0) - 1); };
     q('#q+').onclick = () => { const i = q('#f-qty'); i.value = (parseInt(i.value) || 0) + 1; };
     q('#f-stars').onclick = (e) => { const s = +e.target.dataset.s; if (s) { read(); f.rating = f.rating === s ? 0 : s; draw(); } };
@@ -191,8 +259,8 @@ async function openSheet(ctx) {
     };
     q('#f-save').onclick = async () => {
       read();
-      const qty = parseInt(q('#f-qty').value) || 0;
-      const price = num(q('#f-price') ? q('#f-price').value : '');
+      const qty = parseInt(f.qty) || 0;
+      const price = num(f.price || '');
       if (!f.name) { toast('Inserisci il nome del vino'); return; }
       // scheda aperta da scansione: la chiave è codice + annata
       let target = ctx.fromScan ? S.wines.find((x) => x.barcode === barcode && (x.vintage || '') === f.vintage) : ctx.wine;
@@ -203,7 +271,8 @@ async function openSheet(ctx) {
       if (!target) target = { id: uid(), barcode, qty: 0, createdAt: now };
       Object.assign(target, {
         name: f.name, producer: f.producer, vintage: f.vintage, type: f.type, location: f.location,
-        rating: f.rating, drinkFrom: f.drinkFrom, drinkTo: f.drinkTo, notes: f.notes, pairing: f.pairing, updatedAt: now,
+        rating: f.rating, drinkFrom: f.drinkFrom, drinkTo: f.drinkTo, notes: f.notes, pairing: f.pairing,
+        grapes: f.grapes, area: f.area, abv: f.abv, sources: f.sources || [], updatedAt: now,
       });
       target.photo = f.photo || target.photo || '';
       if (!target.photo && f.photoUrl) target.photo = (await fetchImageAsDataUrl(f.photoUrl)) || f.photoUrl;
@@ -222,9 +291,9 @@ async function openSheet(ctx) {
   // Nuova bottiglia da scansione: cerca anagrafica e prezzo di mercato in parallelo.
   if (ctx.fromScan && barcode && (isNew || f.marketPrice == null)) {
     const needInfo = isNew;
-    if (needInfo) bg.querySelector('#f-src').textContent = 'ricerca in corso…';
+    if (needInfo && bg.querySelector('#f-src')) bg.querySelector('#f-src').textContent = 'ricerca in corso…';
     const [info, mp] = await Promise.all([needInfo ? lookupProduct(barcode) : null, marketPrice(barcode)]);
-    if (!document.body.contains(bg)) return;
+    if (closed) return;
     read();
     if (info) {
       if (!f.name) f.name = info.name;
@@ -232,12 +301,45 @@ async function openSheet(ctx) {
       if (!f.photo) f.photoUrl = info.photoUrl;
     }
     if (mp) { f.marketPrice = mp.price; f.marketN = mp.n; }
-    const qv = bg.querySelector('#f-qty').value, pv = bg.querySelector('#f-price') ? bg.querySelector('#f-price').value : '';
     ctx.lookup = needInfo ? (info ? `dati da ${info.source}` : 'non trovata online: inserisci i dati') : '';
     draw();
-    bg.querySelector('#f-qty').value = qv;
-    if (bg.querySelector('#f-price')) bg.querySelector('#f-price').value = pv;
   }
+  if (ctx.autoInfo && f.name) runWeb(true);
+}
+
+// ---------- foto etichetta: riconosce prima le bottiglie già in cantina ----------
+function pickCandidate(cands) {
+  return new Promise((res) => {
+    const bg = document.createElement('div');
+    bg.className = 'sheet-bg';
+    bg.innerHTML = `<div class="sheet"><div class="sheet-head"><span class="sheet-title">Quale bottiglia?</span><button id="pk-x" type="button" aria-label="Chiudi">✕</button></div>
+      ${cands.map((c, i) => `<div class="card" data-i="${i}"><div class="thumb">${glass(c.w.type, 46)}</div><div class="grow"><div class="ttl">${esc(c.w.name)}</div><div class="sub">${esc([c.w.producer, c.w.vintage].filter(Boolean).join(' · '))} · ${c.w.qty} bott.</div></div></div>`).join('')}
+      <button class="btn ghost" id="pk-new" style="margin-top:10px" type="button">Nessuna: è una bottiglia nuova</button></div>`;
+    document.body.appendChild(bg);
+    const done = (v) => { bg.remove(); res(v); };
+    bg.onclick = (e) => {
+      const c = e.target.closest('.card');
+      if (c) return done(cands[+c.dataset.i].w);
+      if (e.target.id === 'pk-new') return done('new');
+      if (e.target === bg || e.target.id === 'pk-x') done(null);
+    };
+  });
+}
+async function labelFlow() {
+  const r = await labelScan();
+  if (!r) return;
+  const pool = S.mode === 'scarico' ? S.wines.filter((w) => w.qty > 0) : S.wines;
+  const cands = matchCellar(r, pool);
+  let owned = null;
+  if (isClear(cands)) owned = cands[0].w;
+  else if (cands.length) {
+    const p = await pickCandidate(cands);
+    if (p === null) return;
+    if (p !== 'new') owned = p;
+  }
+  if (owned) return openSheet({ wine: owned, mode: S.mode, defaultQty: true });
+  if (S.mode === 'scarico') { toast('Non trovo questa bottiglia in cantina: aprila dall’elenco'); return; }
+  openSheet({ mode: 'carico', autoInfo: !!r.name, prefill: { name: r.name, producer: r.producer, vintage: r.vintage, type: r.type, photoUrl: r.photo } });
 }
 
 // ---------- scansione ----------
@@ -278,7 +380,7 @@ function viewCantina() {
     ${list.length ? list.map((w) => {
       const p = shownPrice(w);
       const win = w.drinkFrom || w.drinkTo ? ` · ${w.drinkFrom || '…'}–${w.drinkTo || '…'}` : '';
-      return `<div class="card" data-id="${w.id}"><div class="thumb" style="${w.photo ? `background-image:url('${esc(w.photo)}')` : ''}">${w.photo ? '' : '🍷'}</div>
+      return `<div class="card" data-id="${w.id}"><div class="thumb" style="${w.photo ? `background-image:url('${esc(w.photo)}')` : ''}">${w.photo ? '' : glass(w.type, 46)}</div>
         <div class="grow"><div class="ttl">${esc(w.name)}</div><div class="sub">${esc([w.producer, w.vintage, w.size].filter(Boolean).join(' · '))}</div>
         <div class="sub">${p != null ? eur(p) : 'prezzo n.d.'}${esc(win)}${w.location ? ' · ' + esc(w.location) : ''}</div></div><div class="qty">${w.qty}</div></div>`;
     }).join('') : `<div class="empty">${S.wines.length ? 'Nessun risultato.' : 'La cantina è vuota.<br>Scansiona una bottiglia o aggiungila a mano.'}</div>`}`;
@@ -307,7 +409,7 @@ function viewDisc() {
     <div class="row" style="margin-top:10px"><input id="d-nm" placeholder="Oppure nome del vino" style="flex:3" value="${esc(d && !d.code ? d.name : '')}"/><button class="btn ghost" id="d-gn" style="flex:1">Cerca</button></div>`;
   if (!d) return out;
   if (d.loading) return out + `<div class="empty">${esc(d.loading)}</div>`;
-  out += `<div class="card" style="margin-top:16px"><div class="thumb" style="${d.photoUrl ? `background-image:url('${esc(d.photoUrl)}')` : ''}">${d.photoUrl ? '' : '🍷'}</div>
+  out += `<div class="card" style="margin-top:16px"><div class="thumb" style="${d.photoUrl ? `background-image:url('${esc(d.photoUrl)}')` : ''}">${d.photoUrl ? '' : glass(d.labelType || 'Altro', 46)}</div>
     <div class="grow"><div class="ttl">${esc(d.name || 'Vino non identificato')}</div><div class="sub">${esc(d.producer || '')}</div>
     <div class="sub">${d.code ? 'Codice ' + esc(d.code) + ' · ' : ''}${esc(d.source || '')}${d.mp != null ? ' · ' + eur(d.mp) : ''}</div></div></div>`;
   if (!d.name) out += `<div class="note">Nome non riconosciuto: scrivilo qui sopra e tocca Cerca.</div>`;
@@ -423,7 +525,7 @@ function bind() {
     $('#cont').onchange = (e) => { S.cont = e.target.checked; };
     $('#scan').onclick = doScan;
     $('#addman2').onclick = () => openSheet({ mode: 'carico' });
-    $('#lab2').onclick = async () => { const r = await labelScan(); if (r) openSheet({ mode: 'carico', prefill: { name: r.name, producer: r.producer, vintage: r.vintage, type: r.type, photoUrl: r.photo } }); };
+    $('#lab2').onclick = labelFlow;
     const go = () => { const v = $('#manual').value; if (v.trim()) handleCode(v); };
     $('#go').onclick = go;
     $('#manual').onkeydown = (e) => { if (e.key === 'Enter') go(); };
@@ -478,7 +580,7 @@ async function saveAndShare(name, text, mime) {
 const stamp = () => new Date().toISOString().slice(0, 10);
 const exportJson = () => saveAndShare(`cantina-${stamp()}.json`, JSON.stringify({ v: 1, wines: S.wines, moves: S.moves }), 'application/json');
 function exportCsv() {
-  const cols = ['name', 'producer', 'vintage', 'type', 'qty', 'barcode', 'location', 'marketPrice', 'rating', 'drinkFrom', 'drinkTo', 'pairing', 'notes'];
+  const cols = ['name', 'producer', 'vintage', 'type', 'qty', 'size', 'barcode', 'location', 'grapes', 'area', 'abv', 'marketPrice', 'rating', 'drinkFrom', 'drinkTo', 'pairing', 'notes'];
   const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const rows = S.wines.map((w) => cols.map((c) => cell(w[c])).join(';'));
   saveAndShare(`cantina-${stamp()}.csv`, '﻿' + cols.join(';') + '\n' + rows.join('\n'), 'text/csv');
@@ -490,19 +592,30 @@ function importTxt() {
     try {
       const { items, skipped } = parseList(await i.files[0].text());
       if (!items.length) { toast('Nessuna bottiglia trovata nel file'); return; }
-      const same = (it) => S.wines.find((w) => normName(w.name) === normName(it.name) && String(w.vintage || '') === it.vintage && (w.location || '') === it.location);
-      const fresh = items.filter((it) => !same(it));
-      const dup = items.length - fresh.length;
+      const full = (x) => `${x.producer || ''} ${x.name}`;
+      const findSame = (it) => S.wines.find((w) => String(w.vintage || '') === it.vintage && (w.location || '') === it.location
+        && (normName(full(w)) === normName(full(it)) || nameSim(full(w), full(it)) >= 0.75));
+      const upd = [], fresh = [];
+      for (const it of items) { const ex = findSame(it); if (ex) upd.push([ex, it]); else fresh.push(it); }
       const bottles = fresh.reduce((s, x) => s + x.qty, 0);
-      if (!fresh.length) { toast('Sono già tutte presenti'); return; }
-      if (!confirm(`Importare ${fresh.length} vini (${bottles} bottiglie)?${dup ? `\n${dup} già presenti: le salto.` : ''}${skipped.length ? `\n${skipped.length} righe non lette.` : ''}`)) return;
+      if (!confirm(`Trovate ${items.length} voci.\n${fresh.length} nuove (${bottles} bottiglie).${upd.length ? `\n${upd.length} già presenti: aggiorno i dati, le quantità restano.` : ''}${skipped.length ? `\n${skipped.length} righe non lette.` : ''}\n\nProcedere?`)) return;
       const now = Date.now();
+      const fill = (w, it) => {
+        w.producer = it.producer || w.producer || ''; w.name = it.name; w.size = it.size || w.size || '';
+        if (it.type && (it.type !== 'Altro' || !w.type || w.type === 'Altro')) w.type = it.type;
+        for (const k of ['grapes', 'area', 'abv', 'notes', 'pairing', 'drinkFrom', 'drinkTo']) if (it[k]) w[k] = it[k];
+        if (it.marketPrice != null) { w.marketPrice = it.marketPrice; w.marketN = 0; w.marketAt = now; }
+        if (it.sources.length) w.sources = it.sources;
+        w.updatedAt = now;
+      };
+      for (const [w, it] of upd) { fill(w, it); await put('wines', w); }
       for (const it of fresh) {
-        const w = { id: uid(), barcode: '', name: it.name, producer: '', vintage: it.vintage, type: it.type, location: it.location, size: it.size, qty: it.qty, photo: '', rating: 0, createdAt: now, updatedAt: now };
+        const w = { id: uid(), barcode: '', qty: it.qty, location: it.location, photo: '', rating: 0, createdAt: now };
+        fill(w, it);
         await put('wines', w);
         await put('moves', { id: uid(), wineId: w.id, ts: now, delta: it.qty, price: null });
       }
-      await refresh(); toast(`Importate ${fresh.length} voci (${bottles} bottiglie)`);
+      await refresh(); toast(`Importate ${fresh.length} nuove, aggiornate ${upd.length}`);
     } catch { toast('File non valido'); }
   };
   i.click();
